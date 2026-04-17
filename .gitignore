@@ -1,4 +1,5 @@
 __pycache__/
 *.py[cod]
 python-installer.exe
+gh-installer.msi
 .claude/
