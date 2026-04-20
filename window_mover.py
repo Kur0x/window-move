@@ -18,6 +18,7 @@ window_mover.py — 自动移动前台窗口，减少视觉疲劳
 """
 
 import configparser
+import ctypes
 import math
 import os
 import random
@@ -37,7 +38,23 @@ SPEED_PRESETS = [10, 20, 40, 60, 100, 150, 200]
 STEP_PRESETS = [2, 4, 6, 10, 20, 30, 40]
 TRAVEL_PRESETS = [50, 100, 150, 250, 400, 600]
 BOTTOM_PADDING_PRESETS = [8, 12, 18, 24, 32, 40]
-MONITOR_MODES = ["current_monitor", "switch_monitor"]
+SWITCH_COOLDOWN_SECONDS = 0.35
+
+
+def enable_dpi_awareness():
+    windll = getattr(ctypes, "windll", None)
+    if windll is None:
+        return
+    user32 = windll.user32
+    try:
+        user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        return
+    except Exception:
+        pass
+    try:
+        user32.SetProcessDPIAware()
+    except Exception:
+        pass
 
 
 def load_config(path: str = CONFIG_PATH) -> dict:
@@ -149,6 +166,27 @@ def clamp_to_bounds(x: int, y: int, bounds: tuple[int, int, int, int]) -> tuple[
     return max(min_x, min(x, max_x)), max(min_y, min(y, max_y))
 
 
+def settle_window_in_monitor(hwnd: int, monitor: dict, cfg: dict) -> tuple[int, int, int, int] | None:
+    rect = get_window_rect(hwnd)
+    if rect is None:
+        return None
+    x, y, w, h = rect
+    for _ in range(3):
+        bounds = get_monitor_bounds(monitor, cfg, w, h)
+        clamped_x, clamped_y = clamp_to_bounds(x, y, bounds)
+        if clamped_x == x and clamped_y == y:
+            return x, y, w, h
+        try:
+            win32gui.MoveWindow(hwnd, int(clamped_x), int(clamped_y), w, h, True)
+        except Exception:
+            return x, y, w, h
+        rect = get_window_rect(hwnd)
+        if rect is None:
+            return clamped_x, clamped_y, w, h
+        x, y, w, h = rect
+    return x, y, w, h
+
+
 def should_skip_window(hwnd: int, monitors: list[dict]) -> bool:
     if not hwnd:
         return True
@@ -184,6 +222,13 @@ def get_other_monitor(current: dict | None, monitors: list[dict]) -> dict | None
     return current
 
 
+def get_monitor_by_handle(handle, monitors: list[dict]) -> dict | None:
+    for monitor in monitors:
+        if monitor["handle"] == handle:
+            return monitor
+    return None
+
+
 class DriftState:
     def __init__(self, x: float, y: float, step_distance: float, dx: float | None = None, dy: float | None = None):
         self.x = float(x)
@@ -197,6 +242,8 @@ class DriftState:
         self.dy = dy / mag * step_distance
         self.traveled = 0.0
         self.target_travel = 0.0
+        self.last_switch_time = 0.0
+        self.last_switch_target_handle = None
 
     def reset_target(self, min_travel: float):
         self.target_travel = random.uniform(min_travel, min_travel * 2)
@@ -240,6 +287,16 @@ def movement_loop(cfg_holder: list, pause_event: threading.Event,
             time.sleep(0.1)
             continue
 
+        locked_monitor = None
+        if (
+            drift is not None
+            and drift.last_switch_target_handle is not None
+            and time.time() - drift.last_switch_time < SWITCH_COOLDOWN_SECONDS
+        ):
+            locked_monitor = get_monitor_by_handle(drift.last_switch_target_handle, monitors)
+            if locked_monitor is not None:
+                current_monitor = locked_monitor
+
         if mode == "smooth_drift":
             tick = cfg["tick_interval"]
             speed = max(1.0, float(cfg["speed"]))
@@ -247,6 +304,11 @@ def movement_loop(cfg_holder: list, pause_event: threading.Event,
             min_travel = float(cfg["min_travel"])
             sleep_time = max(0.01, step_distance / speed)
             bounds = get_monitor_bounds(current_monitor, cfg, w, h)
+            if locked_monitor is not None:
+                settled_rect = settle_window_in_monitor(hwnd, current_monitor, cfg)
+                if settled_rect is not None:
+                    x, y, w, h = settled_rect
+                    bounds = get_monitor_bounds(current_monitor, cfg, w, h)
 
             if drift is None or hwnd != last_hwnd:
                 drift = DriftState(x, y, step_distance)
@@ -266,8 +328,15 @@ def movement_loop(cfg_holder: list, pause_event: threading.Event,
             ny = drift.y + drift.dy
             min_x, max_x, min_y, max_y = bounds
             bounced = False
+            now = time.time()
+            switch_inset = max(int(step_distance * 2), 20)
+            can_switch = (
+                cfg["monitor_mode"] == "switch_monitor"
+                and len(monitors) > 1
+                and now - drift.last_switch_time >= SWITCH_COOLDOWN_SECONDS
+            )
 
-            if cfg["monitor_mode"] == "switch_monitor" and len(monitors) > 1:
+            if can_switch:
                 switched = False
                 if nx < min_x or nx > max_x:
                     target_monitor = get_other_monitor(current_monitor, monitors)
@@ -280,18 +349,32 @@ def movement_loop(cfg_holder: list, pause_event: threading.Event,
                         ny = target_min_y + int(relative_y * target_height)
                         ny = max(target_min_y, min(ny, target_max_y))
                         if nx < min_x:
-                            nx = target_max_x
+                            nx = max(target_min_x, target_max_x - switch_inset)
                         else:
-                            nx = target_min_x
+                            nx = min(target_max_x, target_min_x + switch_inset)
+                        nx, ny = clamp_to_bounds(nx, ny, target_bounds)
                         current_monitor = target_monitor
                         bounds = target_bounds
                         min_x, max_x, min_y, max_y = bounds
+                        drift.last_switch_time = now
+                        drift.last_switch_target_handle = target_monitor["handle"]
+                        drift.reset_target(min_travel)
                         switched = True
-                if not switched:
-                    if nx < min_x or nx > max_x:
-                        drift.dx = -drift.dx
-                        nx = max(min_x, min(nx, max_x))
-                        bounced = True
+                        try:
+                            win32gui.MoveWindow(hwnd, int(nx), int(ny), w, h, True)
+                            settled_rect = settle_window_in_monitor(hwnd, target_monitor, cfg)
+                            if settled_rect is not None:
+                                nx, ny, w, h = settled_rect
+                                target_bounds = get_monitor_bounds(target_monitor, cfg, w, h)
+                                nx, ny = clamp_to_bounds(nx, ny, target_bounds)
+                                bounds = target_bounds
+                                min_x, max_x, min_y, max_y = bounds
+                        except Exception:
+                            pass
+                if not switched and (nx < min_x or nx > max_x):
+                    drift.dx = -drift.dx
+                    nx = max(min_x, min(nx, max_x))
+                    bounced = True
             else:
                 if nx < min_x or nx > max_x:
                     drift.dx = -drift.dx
@@ -502,6 +585,7 @@ def build_tray_icon(cfg_holder: list, pause_event: threading.Event,
 
 
 def main():
+    enable_dpi_awareness()
     cfg = load_config()
     cfg_holder = [cfg]
     mode_holder = [cfg["mode"]]
