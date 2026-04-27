@@ -39,6 +39,12 @@ STEP_PRESETS = [2, 4, 6, 10, 20, 30, 40]
 TRAVEL_PRESETS = [50, 100, 150, 250, 400, 600]
 BOTTOM_PADDING_PRESETS = [8, 12, 18, 24, 32, 40]
 SWITCH_COOLDOWN_SECONDS = 0.35
+SHELL_WINDOW_CLASSES = {
+    "Progman",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+    "WorkerW",
+}
 
 
 def enable_dpi_awareness():
@@ -190,7 +196,19 @@ def settle_window_in_monitor(hwnd: int, monitor: dict, cfg: dict) -> tuple[int, 
 def should_skip_window(hwnd: int, monitors: list[dict]) -> bool:
     if not hwnd:
         return True
+    try:
+        root_hwnd = win32gui.GetAncestor(hwnd, win32con.GA_ROOT)
+    except Exception:
+        root_hwnd = hwnd
+    if root_hwnd != hwnd:
+        hwnd = root_hwnd
     if not win32gui.IsWindowVisible(hwnd):
+        return True
+    try:
+        class_name = win32gui.GetClassName(hwnd)
+    except Exception:
+        return True
+    if class_name in SHELL_WINDOW_CLASSES:
         return True
     try:
         show_cmd = win32gui.GetWindowPlacement(hwnd)[1]
